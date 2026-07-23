@@ -9,7 +9,17 @@ cd /Users/ziz/projet/agent
 uv tool install .
 ```
 
-## Configure
+## Run
+
+```bash
+cosmo
+```
+
+On first launch, cosmo asks for your Anthropic API key and stores it at
+`~/.config/cosmo/api_key` (file permissions `600`). After that it starts
+straight into the chat.
+
+You can also provide the key via env vars, which take priority:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
@@ -17,17 +27,21 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export COSMO_MODEL=claude-sonnet-4-5
 ```
 
-## Run
-
-```bash
-cosmo
-```
 
 Type `exit`, `quit`, or press Ctrl-C to leave.
+
+## Tools
+
+cosmo is agentic: the model can call tools and cosmo runs them, feeding the
+results back until the task is done.
+
+- **run_terminal** — runs a shell command on your machine. For safety, cosmo
+  prints each command and asks `y/N` before executing it.
+
 
 ## Dev (without installing)
 
 ```bash
 uv run cosmo
 ```
-# cosmo
+
