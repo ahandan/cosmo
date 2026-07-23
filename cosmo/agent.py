@@ -16,11 +16,13 @@ from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich.text import Text
 
-MODEL = os.environ.get("COSMO_MODEL", "claude-sonnet-4-5")
+MODEL = os.environ.get("COSMO_MODEL", "claude-opus-4-8")
 MAX_TOKENS = 4096
 CONFIG_FILE = Path.home() / ".config" / "cosmo" / "api_key"
+VERBOSE = os.environ.get("COSMO_VERBOSE", "").lower() in {"1", "true", "yes"}
 
 console = Console()
+
 
 SYSTEM_PROMPT = (
     "You are cosmo, a helpful terminal coding assistant. "
@@ -81,28 +83,25 @@ def run_terminal(command: str) -> str:
     output = (result.stdout or "") + (result.stderr or "")
     output = output.strip() or f"(no output, exit code {result.returncode})"
 
-    # Collapse long output so the terminal stays tidy.
-    console.print(
-        Panel(
-            Text(_collapse(output), style="grey70"),
-            title="[dim]output[/]",
-            subtitle="[dim]collapsed[/]" if output.count("\n") >= 12 else None,
-            border_style="grey37",
-            padding=(0, 1),
+    # Everything except the command + cosmo's message is collapsed into a
+    # single dim summary line. Set COSMO_VERBOSE=1 to expand full output.
+    n_lines = output.count("\n") + 1
+    if VERBOSE:
+        console.print(
+            Panel(
+                Text(output, style="grey70"),
+                title="[dim]output[/]",
+                border_style="grey37",
+                padding=(0, 1),
+            )
         )
-    )
+    else:
+        console.print(
+            f"  [grey50]▸ output · {n_lines} line(s) hidden "
+            f"[dim](set COSMO_VERBOSE=1 to show)[/][/]"
+        )
     return output
 
-
-def _collapse(text: str, head: int = 8, tail: int = 3) -> str:
-    """Shorten multi-line text to a head/tail preview with a hidden-line note."""
-    lines = text.splitlines()
-    if len(lines) <= head + tail + 1:
-        return text
-    hidden = len(lines) - head - tail
-    return "\n".join(
-        lines[:head] + [f"… {hidden} more lines …"] + lines[-tail:]
-    )
 
 
 
