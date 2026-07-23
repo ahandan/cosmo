@@ -30,7 +30,19 @@ export COSMO_MODEL=claude-sonnet-4-5
 
 Type `exit`, `quit`, or press Ctrl-C to leave.
 
+## Live settings (in-chat commands)
+
+Change settings on the fly without restarting — they persist to
+`~/.config/cosmo/settings.json`:
+
+- `/settings` — show current settings
+- `/set model <name>` — switch the model live
+- `/set verbose on|off` — show or collapse command output
+- `/last` — reprint the last command's full output
+- `/help` — list commands
+
 ## Tools
+
 
 cosmo is agentic: the model can call tools and cosmo runs them, feeding the
 results back until the task is done.

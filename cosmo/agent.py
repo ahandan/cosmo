@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import getpass
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -14,15 +15,15 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.syntax import Syntax
+from rich.table import Table
 from rich.text import Text
 
-MODEL = os.environ.get("COSMO_MODEL", "claude-opus-4-8")
+CONFIG_DIR = Path.home() / ".config" / "cosmo"
+CONFIG_FILE = CONFIG_DIR / "api_key"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
 MAX_TOKENS = 4096
-CONFIG_FILE = Path.home() / ".config" / "cosmo" / "api_key"
-VERBOSE = os.environ.get("COSMO_VERBOSE", "").lower() in {"1", "true", "yes"}
 
 console = Console()
-
 
 SYSTEM_PROMPT = (
     "You are cosmo, a helpful terminal coding assistant. "
@@ -52,8 +53,116 @@ TOOLS = [
 ]
 
 
+class Settings:
+    """Live, editable, persisted settings for cosmo."""
+
+    DEFAULTS = {
+        "model": "claude-opus-4-8",
+        "verbose": False,
+    }
+
+    def __init__(self) -> None:
+        data = dict(self.DEFAULTS)
+        if SETTINGS_FILE.exists():
+            try:
+                data.update(json.loads(SETTINGS_FILE.read_text()))
+            except (json.JSONDecodeError, OSError):
+                pass
+        # Env vars override the stored file at startup.
+        if "COSMO_MODEL" in os.environ:
+            data["model"] = os.environ["COSMO_MODEL"]
+        if "COSMO_VERBOSE" in os.environ:
+            data["verbose"] = os.environ["COSMO_VERBOSE"].lower() in {"1", "true", "yes"}
+        self.model: str = data["model"]
+        self.verbose: bool = bool(data["verbose"])
+
+    def save(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_FILE.write_text(
+            json.dumps({"model": self.model, "verbose": self.verbose}, indent=2)
+        )
+
+    def as_table(self) -> Table:
+        table = Table(title="cosmo settings", title_style="bold cyan", border_style="cyan")
+        table.add_column("setting", style="bold")
+        table.add_column("value", style="green")
+        table.add_row("model", str(self.model))
+        table.add_row("verbose", "on" if self.verbose else "off")
+        return table
+
+
+settings = Settings()
+
+# Remembers the most recent command output for /last.
+_last_output: str = ""
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in {"on", "1", "true", "yes", "y"}
+
+
+def handle_command(line: str) -> bool:
+    """Handle a /slash command. Return True if the line was a command."""
+    global _last_output
+    if not line.startswith("/"):
+        return False
+
+    parts = line[1:].split()
+    cmd = parts[0].lower() if parts else ""
+    args = parts[1:]
+
+    if cmd in {"settings", "config"}:
+        console.print(settings.as_table())
+
+    elif cmd == "set":
+        if len(args) < 2:
+            console.print("[yellow]usage:[/] /set <model|verbose> <value>")
+        else:
+            key, value = args[0].lower(), " ".join(args[1:])
+            if key == "verbose":
+                settings.verbose = _truthy(value)
+                console.print(f"[green]✓[/] verbose = {'on' if settings.verbose else 'off'}")
+            elif key == "model":
+                settings.model = value
+                console.print(f"[green]✓[/] model = {value}")
+            else:
+                console.print(f"[yellow]unknown setting:[/] {key}")
+                return True
+            settings.save()
+
+    elif cmd == "last":
+        if _last_output:
+            console.print(
+                Panel(Text(_last_output, style="grey70"), title="[dim]last output[/]",
+                      border_style="grey37", padding=(0, 1))
+            )
+        else:
+            console.print("[dim]no command output yet[/]")
+
+    elif cmd == "help":
+        console.print(
+            Panel(
+                "[bold]/settings[/]           show current settings\n"
+                "[bold]/set model <name>[/]   switch the model\n"
+                "[bold]/set verbose on|off[/] show or hide command output\n"
+                "[bold]/last[/]               reprint the last command output\n"
+                "[bold]/help[/]               show this help\n"
+                "[bold]exit[/]                quit cosmo",
+                title="[bold cyan]commands[/]",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+        )
+
+    else:
+        console.print(f"[yellow]unknown command:[/] /{cmd}  (try /help)")
+
+    return True
+
+
 def run_terminal(command: str) -> str:
     """Execute a shell command (after confirmation) and return its output."""
+    global _last_output
     console.print(
         Panel(
             Syntax(command, "bash", theme="ansi_dark", word_wrap=True),
@@ -82,11 +191,10 @@ def run_terminal(command: str) -> str:
         )
     output = (result.stdout or "") + (result.stderr or "")
     output = output.strip() or f"(no output, exit code {result.returncode})"
+    _last_output = output
 
-    # Everything except the command + cosmo's message is collapsed into a
-    # single dim summary line. Set COSMO_VERBOSE=1 to expand full output.
     n_lines = output.count("\n") + 1
-    if VERBOSE:
+    if settings.verbose:
         console.print(
             Panel(
                 Text(output, style="grey70"),
@@ -98,11 +206,9 @@ def run_terminal(command: str) -> str:
     else:
         console.print(
             f"  [grey50]▸ output · {n_lines} line(s) hidden "
-            f"[dim](set COSMO_VERBOSE=1 to show)[/][/]"
+            f"[dim](/set verbose on, or /last)[/][/]"
         )
     return output
-
-
 
 
 def load_api_key() -> str:
@@ -121,7 +227,7 @@ def load_api_key() -> str:
     if not key:
         raise SystemExit("No API key provided.")
 
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(key)
     CONFIG_FILE.chmod(0o600)
     console.print(f"[green]✓[/] Saved API key to [dim]{CONFIG_FILE}[/]\n")
@@ -136,20 +242,15 @@ def run_tool(name: str, args: dict) -> str:
 
 
 def stream_turn(client: Anthropic, messages: list[dict]) -> tuple[str, list[dict]]:
-    """Stream one assistant turn.
-
-    While generating, show a compact, transient "thinking" line that collapses
-    away when done. Then print the full reply once as a single clean panel.
-    """
+    """Stream one assistant turn, then print the reply once as a clean panel."""
     text_so_far = ""
     with client.messages.stream(
-        model=MODEL,
+        model=settings.model,
         max_tokens=MAX_TOKENS,
         system=SYSTEM_PROMPT,
         tools=TOOLS,
         messages=messages,
     ) as stream:
-        # transient=True => this live preview is erased when the block exits.
         with Live(console=console, refresh_per_second=12, transient=True) as live:
             for text in stream.text_stream:
                 text_so_far += text
@@ -165,12 +266,9 @@ def stream_turn(client: Anthropic, messages: list[dict]) -> tuple[str, list[dict
                 live.update(Text("cosmo ⚙ using a tool…", style="dim green"))
         final = stream.get_final_message()
 
-    # Print the finished reply once, as a stable (non-repainting) panel.
     if text_so_far.strip():
         console.print(_assistant_panel(text_so_far))
 
-
-    # Rebuild clean content blocks (model_dump adds extra fields the API rejects).
     blocks: list[dict] = []
     for block in final.content:
         if block.type == "text":
@@ -201,11 +299,11 @@ def _banner() -> Panel:
     art = Text()
     art.append("cosmo", style="bold cyan")
     art.append("  ·  your terminal agent\n", style="cyan")
-    art.append(f"model: {MODEL}\n", style="dim")
+    art.append(f"model: {settings.model}\n", style="dim")
     art.append("type ", style="dim")
+    art.append("/help", style="bold")
+    art.append(" for commands · ", style="dim")
     art.append("exit", style="bold")
-    art.append(" or press ", style="dim")
-    art.append("Ctrl-C", style="bold")
     art.append(" to quit", style="dim")
     return Panel(art, border_style="cyan", padding=(1, 2))
 
@@ -228,6 +326,8 @@ def main() -> None:
         if user_input.lower() in {"exit", "quit"}:
             console.print("[cyan]bye 👋[/]")
             return
+        if handle_command(user_input):
+            continue
 
         messages.append({"role": "user", "content": user_input})
 
