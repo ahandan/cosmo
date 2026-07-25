@@ -28,6 +28,80 @@ CONFIG_FILE = CONFIG_DIR / "api_key"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 MAX_TOKENS = 4096
+PRICES_FILE = CONFIG_DIR / "prices.json"
+CONTEXT_LIMIT_FALLBACK = 200_000
+
+# Prices are USD per 1M tokens (MTok). Model IDs + context windows come live
+# from the Anthropic API (client.models.list); only prices are maintained here.
+# Verify current values at:
+# https://platform.claude.com/docs/en/about-claude/pricing
+DEFAULT_PRICES = {
+    "claude-opus-4-20250514":    {"input": 15.0, "output": 75.0},
+    "claude-sonnet-4-20250514":  {"input": 3.0,  "output": 15.0},
+    "claude-3-5-haiku-20241022": {"input": 0.80, "output": 4.0},
+}
+
+
+def load_prices() -> dict:
+    """Local price overlay: built-in defaults merged with prices.json."""
+    prices = dict(DEFAULT_PRICES)
+    if PRICES_FILE.exists():
+        try:
+            prices.update(json.loads(PRICES_FILE.read_text()))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return prices
+
+
+_models_cache: list | None = None
+
+
+def get_models(client: "Anthropic", refresh: bool = False) -> list[dict]:
+    """Live model catalog from Anthropic, merged with local prices. Cached."""
+    global _models_cache
+    if _models_cache is not None and not refresh:
+        return _models_cache
+    prices = load_prices()
+    models: list[dict] = []
+    try:
+        for m in client.models.list(limit=100):
+            info = prices.get(m.id, {})
+            models.append(
+                {
+                    "id": m.id,
+                    "label": getattr(m, "display_name", m.id),
+                    "context": getattr(m, "max_input_tokens", None) or CONTEXT_LIMIT_FALLBACK,
+                    "max_out": getattr(m, "max_tokens", None),
+                    "input": info.get("input"),
+                    "output": info.get("output"),
+                    "created": str(getattr(m, "created_at", ""))[:10],
+                }
+            )
+    except Exception as exc:  # network / auth / SDK issues
+        console.print(f"[yellow]could not fetch models:[/] {exc}")
+        return _models_cache or []
+    _models_cache = models
+    return models
+
+
+def model_meta(client: "Anthropic", model_id: str) -> dict:
+    """Price/context info for one model id, with a safe fallback."""
+    for m in get_models(client):
+        if m["id"] == model_id:
+            return m
+    prices = load_prices().get(model_id, {})
+    return {
+        "id": model_id, "label": model_id, "context": CONTEXT_LIMIT_FALLBACK,
+        "input": prices.get("input"), "output": prices.get("output"),
+    }
+
+
+def estimate_cost(client: "Anthropic", model_id: str, in_tok: int, out_tok: int) -> float | None:
+    """Estimated USD cost, or None if this model has no known price."""
+    meta = model_meta(client, model_id)
+    if meta.get("input") is None or meta.get("output") is None:
+        return None
+    return (in_tok / 1e6) * meta["input"] + (out_tok / 1e6) * meta["output"]
 
 
 console = Console()
@@ -143,6 +217,10 @@ class Session:
         self.model = model
         self.messages: list[dict] = messages or []
         self.title = title
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self.tool_calls = 0
+        self.last_input_tokens = 0
 
     @classmethod
     def new(cls) -> "Session":
@@ -167,6 +245,9 @@ class Session:
             "created": self.created,
             "model": self.model,
             "title": self.title,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "tool_calls": self.tool_calls,
             "messages": self.messages,
         }, indent=2))
 
@@ -176,10 +257,14 @@ class Session:
         if not path.exists():
             return None
         data = json.loads(path.read_text())
-        return cls(sid=data["id"], created=data["created"],
-                   model=data.get("model", settings.model),
-                   messages=data.get("messages", []),
-                   title=data.get("title", ""))
+        obj = cls(sid=data["id"], created=data["created"],
+                  model=data.get("model", settings.model),
+                  messages=data.get("messages", []),
+                  title=data.get("title", ""))
+        obj.input_tokens = data.get("input_tokens", 0)
+        obj.output_tokens = data.get("output_tokens", 0)
+        obj.tool_calls = data.get("tool_calls", 0)
+        return obj
 
     @staticmethod
     def list_all() -> list[dict]:
@@ -207,7 +292,7 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in {"on", "1", "true", "yes", "y"}
 
 
-def handle_command(line: str, messages: list[dict]) -> bool:
+def handle_command(line: str, messages: list[dict], client: "Anthropic") -> bool:
     """Handle a /slash command. Return True if the line was a command."""
     global _last_output, session
     if not line.startswith("/"):
@@ -268,6 +353,36 @@ def handle_command(line: str, messages: list[dict]) -> bool:
             )
 
 
+    elif cmd == "models":
+        models = get_models(client, refresh=("refresh" in args))
+        if not models:
+            console.print("[dim]no models returned[/]")
+            return True
+        table = Table(title="cosmo models", title_style="bold cyan",
+                      border_style="cyan")
+        table.add_column("", width=2)
+        table.add_column("model id", style="bold")
+        table.add_column("name", style="green")
+        table.add_column("context", justify="right", style="dim")
+        table.add_column("$in/M", justify="right", style="yellow")
+        table.add_column("$out/M", justify="right", style="yellow")
+        for m in models:
+            mark = "★" if m["id"] == settings.model else ""
+            pin = f"{m['input']:.2f}" if m["input"] is not None else "—"
+            pout = f"{m['output']:.2f}" if m["output"] is not None else "—"
+            table.add_row(mark, m["id"], m["label"],
+                          f"{m['context']:,}", pin, pout)
+        console.print(table)
+        console.print("[dim]switch with[/] /set model <id> "
+                      "[dim]· /models refresh to re-fetch[/]")
+
+    elif cmd == "pricing":
+        if args and args[0] == "refresh":
+            get_models(client, refresh=True)
+            console.print("[green]✓[/] reloaded models + prices")
+        else:
+            console.print("[yellow]usage:[/] /pricing refresh")
+
     elif cmd == "set":
         if len(args) < 2:
             console.print("[yellow]usage:[/] /set <model|verbose> <value>")
@@ -277,6 +392,12 @@ def handle_command(line: str, messages: list[dict]) -> bool:
                 settings.verbose = _truthy(value)
                 console.print(f"[green]✓[/] verbose = {'on' if settings.verbose else 'off'}")
             elif key == "model":
+                known = {m["id"] for m in get_models(client)}
+                if known and value not in known:
+                    console.print(
+                        f"[yellow]⚠ not in model list[/] "
+                        f"[dim]· /models to see options[/]"
+                    )
                 settings.model = value
                 console.print(f"[green]✓[/] model = {value}")
             elif key == "web_search":
@@ -312,6 +433,8 @@ def handle_command(line: str, messages: list[dict]) -> bool:
             Panel(
                 "[bold]/settings[/]           show current settings\n"
                 "[bold]/set model <name>[/]   switch the model\n"
+            "[bold]/models [refresh][/]   list models (live) with prices\n"
+            "[bold]/pricing refresh[/]    reload model + price catalog\n"
                 "[bold]/set verbose on|off[/] show or hide command output\n"
                 "[bold]/set web_search on|off[/] enable Anthropic web search\n"
                 "[bold]/set web_search_max_uses <n>[/] cap searches per turn\n"
@@ -481,6 +604,14 @@ def stream_turn(client: Anthropic, messages: list[dict]) -> tuple[str, list[dict
                 live.update(Text("cosmo ⚙ using a tool…", style="dim green"))
         final = stream.get_final_message()
 
+    usage = getattr(final, "usage", None)
+    if usage is not None:
+        in_tok = getattr(usage, "input_tokens", 0) or 0
+        out_tok = getattr(usage, "output_tokens", 0) or 0
+        session.input_tokens += in_tok
+        session.output_tokens += out_tok
+        session.last_input_tokens = in_tok
+
     _print_web_search(final)
 
     if text_so_far.strip():
@@ -491,6 +622,7 @@ def stream_turn(client: Anthropic, messages: list[dict]) -> tuple[str, list[dict
         if block.type == "text":
             blocks.append({"type": "text", "text": block.text})
         elif block.type == "tool_use":
+            session.tool_calls += 1
             blocks.append(
                 {
                     "type": "tool_use",
@@ -530,6 +662,30 @@ def _assistant_panel(markdown_text: str) -> Panel:
         border_style="green",
         padding=(0, 1),
     )
+
+
+def _footer(client: "Anthropic") -> Text:
+    """Compact per-session metrics line for the chat footer."""
+    tin, tout = session.input_tokens, session.output_tokens
+    cost = estimate_cost(client, settings.model, tin, tout)
+    meta = model_meta(client, settings.model)
+    ctx_limit = meta.get("context") or CONTEXT_LIMIT_FALLBACK
+    ctx_pct = (session.last_input_tokens / ctx_limit * 100) if ctx_limit else 0
+    cost_str = f"${cost:.4f}" if cost is not None else "$--"
+    parts = [
+        (f" {session.id} ", "dim"),
+        ("· ", "grey37"),
+        (f"{len(session.messages)} msgs ", "cyan"),
+        ("· ", "grey37"),
+        (f"↑{tin/1000:.1f}k ↓{tout/1000:.1f}k tok ", "green"),
+        ("· ", "grey37"),
+        (f"{cost_str} ", "yellow"),
+        ("· ", "grey37"),
+        (f"ctx {ctx_pct:.0f}% ", "blue"),
+        ("· ", "grey37"),
+        (f"{session.tool_calls} tools", "magenta"),
+    ]
+    return Text.assemble(*parts)
 
 
 def _banner() -> Panel:
@@ -577,7 +733,7 @@ def main() -> None:
             if image_msg is None:
                 continue
             messages.append(image_msg)
-        elif handle_command(user_input, messages):
+        elif handle_command(user_input, messages, client):
             # /resume or /session new may have swapped the session; re-bind.
             messages = session.messages
             continue
@@ -611,6 +767,7 @@ def main() -> None:
         # Auto-save the session after each completed turn.
         session.messages = messages
         session.save()
+        console.print(_footer(client))
 
 
 
