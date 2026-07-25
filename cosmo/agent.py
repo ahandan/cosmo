@@ -312,13 +312,15 @@ def handle_command(line: str, messages: list[dict], client: "Anthropic") -> bool
         else:
             table = Table(title="cosmo sessions", title_style="bold cyan",
                           border_style="cyan")
+            table.add_column("", width=2)
             table.add_column("id", style="bold")
             table.add_column("date", style="dim")
             table.add_column("msgs", justify="right")
             table.add_column("title", style="green")
             for r in rows[:30]:
                 created = r.get("created", "").replace("T", " ")
-                table.add_row(r.get("id", "?"), created,
+                mark = "★" if r.get("id") == session.id else ""
+                table.add_row(mark, r.get("id", "?"), created,
                               str(len(r.get("messages", []))),
                               r.get("title", "") or "[dim]—[/]")
             console.print(table)
