@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "A minimal terminal chat agent powered by Anthropic Claude."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["anthropic>=0.40", "rich>=13.7"]
+dependencies = [
+    "anthropic>=0.40",
+    "pillow>=12.3.0",
+    "rich>=13.7",
+    "rich-pixels>=3.0.1",
+    "textual>=8.2.8",
+]
 
 
 [project.scripts]
